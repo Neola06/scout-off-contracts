@@ -100,7 +100,7 @@ pub fn filter_players(
     region: String,
     position: String,
     min_level: ProgressLevel,
-    cursor: Bytes,
+    offset: u32,
     limit: u32,
 ) -> Result<FilterResult, ScoutChainError>
 
@@ -497,26 +497,27 @@ Error codes are **per-contract**. The same numeric code can mean different thing
 | 22 | `InvalidAttestation` | ed25519 signature verification failed |
 | 23 | `AttestationKeyNotFound` | No attestation public key registered |
 | 24 | `InvalidNonce` | Attestation nonce already consumed or outside the bounded 256-nonce window |
-| 44 | `AttestationExpired` | Attestation `expires_at` is in the past |
-| 45 | `AttestationWindowTooLarge` | Attestation `expires_at` exceeds the max-future tolerance |
+| 45 | `AttestationExpired` | Attestation `expires_at` is in the past |
+| 46 | `AttestationWindowTooLarge` | Attestation `expires_at` exceeds the max-future tolerance |
 | 25 | `RegistrationCooldown` | Validator registration before cooldown window elapsed |
 | 26 | `DuplicateAttestation` | Same validator already attested to this claim in current round |
 | 27 | `TooManyPendingVotes` | Validator has MAX_PENDING_VOTES_PER_VALIDATOR outstanding votes |
 | 28 | `ThresholdModeRequiresAttestation` | threshold >= 2, must use attest_milestone bypass |
-| 29 | `MigrationNotActive` | Migration window not currently active |
-| 30 | `MilestoneAlreadyExists` | Milestone already exists at (player_id, milestone_index) with different content |
-| 31 | `DisputeAlreadyExists` | Dispute already exists at (player_id, milestone_index) with different content |
-| 32 | `ValidatorRecordEvicted` | Validator record fully evicted, unrecoverable |
-| 33 | `MilestoneRecordEvicted` | Milestone record fully evicted, unrecoverable |
-| 34 | `NotEligibleToReReview` | Caller is not a currently-active validator |
-| 35 | `MilestoneNotFlagged` | Milestone not currently flagged as pending re-review |
-| 36 | `DisputeRequiresJury` | resolve_dispute called on a dispute requiring jury resolution |
-| 37 | `NotJuryDispute` | cast_dispute_vote/tally_dispute called on non-jury dispute |
-| 38 | `VotingWindowClosed` | cast_dispute_vote called after voting window closed |
-| 39 | `ConflictOfInterest` | cast_dispute_vote called by the validator who approved the disputed milestone |
-| 40 | `AlreadyVoted` | cast_dispute_vote called by a validator who already voted on this dispute |
-| 41 | `VotingWindowOpen` | tally_dispute called before voting window closes, vote count is tied |
-| 42 | `QuorumNotReached` | tally_dispute called before quorum of votes has been reached |
+| 29 | `RegistrationCallFailed` | Cross-contract call to the registration contract failed |
+| 30 | `MigrationNotActive` | Migration window not currently active |
+| 31 | `MilestoneAlreadyExists` | Milestone already exists at (player_id, milestone_index) with different content |
+| 32 | `DisputeAlreadyExists` | Dispute already exists at (player_id, milestone_index) with different content |
+| 33 | `ValidatorRecordEvicted` | Validator record fully evicted, unrecoverable |
+| 34 | `MilestoneRecordEvicted` | Milestone record fully evicted, unrecoverable |
+| 35 | `NotEligibleToReReview` | Caller is not a currently-active validator |
+| 36 | `MilestoneNotFlagged` | Milestone not currently flagged as pending re-review |
+| 37 | `DisputeRequiresJury` | resolve_dispute called on a dispute requiring jury resolution — use tally_dispute instead |
+| 38 | `NotJuryDispute` | cast_dispute_vote/tally_dispute called on non-jury dispute |
+| 39 | `VotingWindowClosed` | cast_dispute_vote called after voting window closed |
+| 40 | `ConflictOfInterest` | cast_dispute_vote called by the validator who approved the disputed milestone |
+| 41 | `AlreadyVoted` | cast_dispute_vote called by a validator who already voted on this dispute |
+| 42 | `VotingWindowOpen` | tally_dispute called before voting window closes, vote count is tied |
+| 43 | `QuorumNotReached` | tally_dispute called before quorum of votes has been reached |
 
 ### `ProgressError` (progress)
 
@@ -580,8 +581,8 @@ Error codes are **per-contract**. The same numeric code can mean different thing
 | 36 | `PayToContactPaused` | `pay_to_contact` function is paused independently of whole-contract pause |
 | 37 | `TrialEscrowNotOutstanding` | `admin_refund_trial_escrow` targeted pair with no outstanding `TrialEscrow` entry |
 | 38 | `GrantNotFound` | `admin_revoke_evidence_access` or `revoke_evidence_access` targeted (player_id, scout) pair with no `EvidenceAccessGrant` record |
-| 39 | `GrantAlreadyRevoked` | `revoke_evidence_access` (player-initiated) targeted a grant that was already revoked |
-| 40 | `PlayerNotVerified` | `revoke_evidence_access` caller's wallet does not own the `player_id` passed, or the registration contract is not wired |
+| 42 | `GrantAlreadyRevoked` | `revoke_evidence_access` (player-initiated) targeted a grant that was already revoked |
+| 43 | `PlayerNotVerified` | `revoke_evidence_access` caller's wallet does not own the `player_id` passed, or the registration contract is not wired |
 
 ---
 
@@ -714,7 +715,7 @@ When the progress contract is not wired, a `progress_contract_not_set` event is 
 - **Admin rotation is two-step.** Current admin calls `propose_admin`, then the pending address calls `accept_admin`. The old admin remains active until acceptance.
 - **Error codes are per-contract, not global.** Code `4` means `Unauthorized` in verification but also `Unauthorized` (different context) in scout_access. Code `9` means `ContractPaused` in registration but `RegistrationCallFailed` in progress. Always check which contract returned the error.
 - **Subscription tier check is enforced on-chain.** Basic scouts cannot call `pay_to_contact`. Elite is required for `log_trial_offer`.
-- **`filter_players` requires `cursor` and `limit`.** The limit is capped at 50 server-side. `cursor` is an opaque `Bytes` token; pass an empty `Bytes` on the first call and the returned `next_cursor` on subsequent calls.
+- **`filter_players` requires `offset` and `limit`.** The limit is capped at 50 server-side.
 - **`set_progress_contract` on verification is first-call-only.** Returns `AlreadyConfigured` (code 11) if called again. Use `update_progress_contract` to re-wire.
 - **`approve_milestone` stops working once k-of-n threshold mode is enabled.** Once an admin calls `set_milestone_threshold(n)` with `n >= 2`, both `approve_milestone` and `submit_attested_milestone` return `ThresholdModeRequiresAttestation` (code 28) for every subsequent call — all milestone submissions must go through `attest_milestone` instead. Call `get_milestone_threshold()` to check the current mode before integrating; a return value of `1` (the default) means single-signature mode is still active and `approve_milestone` works as normal. A return value of `2` or higher means every validator must call `attest_milestone` independently, and the milestone commits automatically once the threshold number of distinct active validators have voted for the same `(player_id, evidence_hash)` claim within the configured voting window.
 

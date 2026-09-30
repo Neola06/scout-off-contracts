@@ -42,6 +42,27 @@ That keeps the command copy-paste-runnable in a standard `bash`/`zsh` shell.
 
 ---
 
+## Pagination convention
+
+All paginated getter functions across the four contracts follow a
+consistent convention:
+
+| Parameter | Convention |
+|-----------|-----------|
+| `limit`   | Clamped to **1..=50**. A `limit` of `0` is treated as `1` (or returns `InvalidInput` for functions that return `Result`). |
+| `offset`  | Zero-based item offset into the result set. |
+| `next_cursor` / `total` | Returned so callers know when paging is complete. |
+
+Functions following this convention:
+- `registration::filter_players` — `limit` clamped to 1..=50; returns `InvalidInput` for `limit = 0`
+- `scout_access::get_scout_contacts_page` — `limit` clamped to 1..=50
+- `verification::list_disputes_page` — `limit` clamped to 1..=50
+- `verification::get_global_milestone_index` — `limit` clamped to 1..=50
+- `verification::get_validator_milestones_page_v2` — `limit` clamped to 1..=50
+- `progress::get_progress_history_page` — `limit` clamped to 1..=50 (already correct)
+
+---
+
 ## registration
 
 Handles player and scout on-chain identity: registration, profile updates,
@@ -241,6 +262,42 @@ discovery dashboard.
 ```bash
 stellar contract invoke --id $REGISTRATION_CONTRACT_ID \
   -- verify_scout --scout_id 1
+```
+
+---
+
+#### `set_progress_contract(addr: Address) -> Result<(), ScoutChainError>`
+
+Store the progress contract address so `set_player_level` may only be called
+by it.
+
+---
+
+#### `set_reg_cooldown(cooldown_secs: u64) -> Result<(), ScoutChainError>`
+
+Set the per-wallet registration cooldown in seconds. Pass `0` to disable the
+cooldown entirely. Bounds: `0..=604_800` (7 days).
+
+| | |
+|---|---|
+| **Auth** | Admin must sign |
+| **Errors** | `NotInitialized` · `Unauthorized` · `InvalidCooldown` |
+| **Emits** | `reg_cooldown_updated` with `(admin, old_cooldown, new_cooldown)` |
+
+```bash
+stellar contract invoke --id $REGISTRATION_CONTRACT_ID \
+  -- set_reg_cooldown --cooldown_secs 86400
+```
+
+---
+
+#### `get_reg_cooldown() -> u64`
+
+Return the current registration cooldown in seconds. Defaults to `86400` (24h)
+if no override has been set.
+
+```bash
+stellar contract invoke --id $REGISTRATION_CONTRACT_ID -- get_reg_cooldown
 ```
 
 ---
@@ -496,38 +553,43 @@ stellar contract invoke --id $REGISTRATION_CONTRACT_ID -- get_scout_count
 
 ---
 
-#### `filter_players(region: String, position: String, min_level: ProgressLevel, cursor: Bytes, limit: u32) -> Result<FilterResult, ScoutChainError>`
+#### `filter_players(region: String, position: String, min_level: ProgressLevel, offset: u32, limit: u32) -> Result<FilterResult, ScoutChainError>`
 
 Scout discovery query. Returns up to 50 player profiles matching the given
 region, position, and minimum progress level.
 
-Uses the `PlayersByLevel(level)` index (or the composite
-`PlayersByLevelRegion(level, region)` index when a region is supplied) as the
-entry point so only players at or above `min_level` are loaded.  When `region`
-is empty, the region-less path iterates `PlayersByLevel` buckets for each level
-`>= min_level` instead of scanning the full `PlayerIndex`, keeping gas cost
-proportional to matching levels rather than total player count.  The index is
-maintained automatically on `register_player`, `set_player_level`, and
-`deregister_player`.
+Uses the composite `PlayersByLevelRegion(level, region)` index as the entry
+point so only players that already satisfy the level+region criteria are loaded.
+Gas cost is proportional to the number of matching players, not the total player
+count. The index is maintained automatically on `register_player`,
+`set_player_level`, and `deregister_player`.
 
 Pagination:
-- `cursor` = empty bytes starts from the beginning (first call).
-- Pass the previously returned `FilterResult.next_cursor` value as `cursor` to
+- `offset` = 0 starts from the beginning.
+- Pass the previously returned `FilterResult.next_cursor` value as `offset` to
   fetch the next page.
-- An empty `next_cursor` (with `has_more = false`) means no further results.
-- The cursor is an opaque `Bytes` encoding `(level_index: u32, last_player_id: u64)`.
-  It is **id-based**, not count-based, so pagination is stable across concurrent
-  inserts and deactivations.
+- `next_cursor` = 0 in the response means no further results.
+- Both `offset` and `next_cursor` are *counts* of eligible (non-deactivated,
+  filter-matching) entries, not player IDs.
+- `limit` is clamped to 1..=50 internally. A `limit` of 0 returns
+  `InvalidInput`.
+- `FilterResult.has_more` is `true` when additional pages exist after the
+  current one. Use `has_more` (not `next_cursor != 0`) to decide whether to
+  continue paging, because `next_cursor` is a raw offset value that could
+  theoretically be non-zero even when no more entries remain if the underlying
+  data changed between pages.
 
-> **Bug fix (#1378):** The region-less path previously performed a full
-> `PlayerIndex` scan (O(n) over all registered players) and used a count-based
-> `offset` cursor that could skip or duplicate entries when the underlying index
-> shifted due to concurrent inserts or deactivations.  The path now iterates
-> `PlayersByLevel` buckets and uses an id-based cursor encoding
-> `(level_index, last_player_id)`, making pagination stable.  A per-call scan
-> budget (`MAX_SCAN_PER_CALL = 200`) bounds CPU cost; if the budget is exhausted
-> before all matching results are returned, `has_more` is `true` and a resume
-> cursor is returned.
+> **Past bug (#1017):** `next_cursor` used to be set to the raw `player_id` of
+> the last entry on the page while `offset` was always compared as a count of
+> eligible entries — different units that only coincided by accident when
+> player IDs were contiguous with no filter gaps. Paginating past a
+> non-matching player (e.g. a different position) between pages would skip
+> one eligible entry per such gap. Fixed by making `next_cursor` a count in
+> the same unit as `offset`, matching the contract documented above; both
+> code paths (the region-filtered fast path and the full-scan slow path) and
+> their doc comments were updated together, and a regression test
+> (`test_filter_players_pagination_cursor_no_gaps`) walks a filtered page
+> boundary to assert no entries are skipped or duplicated.
 
 | | |
 |---|---|
@@ -540,7 +602,7 @@ stellar contract invoke --id $REGISTRATION_CONTRACT_ID \
   --region '"West Africa"' \
   --position '"Forward"' \
   --min_level '"Unverified"' \
-  --cursor '[]' \
+  --offset 0 \
   --limit 50
 ```
 
@@ -749,6 +811,27 @@ registration is permitted; duplicate prevention is enforced per role only.
 | 16 | `RegistrationCooldown` | Registration attempted before the cooldown period has elapsed |
 | 17 | `PlayerRecordEvicted` | Player record was evicted from contract storage |
 | 18 | `ScoutRecordEvicted` | Scout record was evicted from contract storage |
+| 19 | `InvalidCooldown` | Cooldown value exceeds the maximum allowed (7 days) |
+
+### Events
+
+| Event | Topics | Data | Description |
+|-------|--------|------|-------------|
+| `player_registered` | event_name, admin (Address) | player_id (u64) | New player profile created |
+| `scout_registered` | event_name, admin (Address) | scout_id (u64) | New scout profile created |
+| `profile_updated` | event_name, wallet (Address) | player_id (u64) | Player profile updated |
+| `player_deregistered` | event_name, admin (Address) | player_id (u64) | Player profile removed |
+| `player_deactivated` | event_name, admin (Address) | player_id (u64) | Player hidden from discovery |
+| `player_reactivated` | event_name, admin (Address) | player_id (u64) | Player restored to discovery |
+| `player_level_synced` | event_name, caller (Address) | player_id (u64) | Player level updated by progress contract |
+| `scout_verified` | event_name, admin (Address) | scout_id (u64) | Scout marked verified |
+| `scout_deactivated` | event_name, admin (Address) | scout_id (u64) | Scout hidden from discovery |
+| `scout_reactivated` | event_name, admin (Address) | scout_id (u64) | Scout restored to discovery |
+| `admin_transfer_proposed` | event_name, old_admin (Address) | new_admin (Address) | Admin replacement proposed |
+| `admin_transferred` | event_name, old_admin (Address) | new_admin (Address) | Pending admin accepts control |
+| `migration_redeemed` | event_name, wallet (Address) | role (MigrationRole), profile_id (u64), new_contract_hint (Address) | Migration authorization redeemed |
+| `wiring_updated` | event_name, admin (Address) | link (String), new_address (Address) | Cross-contract wiring updated |
+| `reg_cooldown_updated` | event_name, admin (Address) | old_cooldown (u64), new_cooldown (u64) | Registration cooldown changed by admin |
 
 ---
 
@@ -990,12 +1073,14 @@ Deactivate a validator. Revoked validators cannot approve milestones.
 
 `reason` is optional and capped at 128 bytes. A `RevocationRecord` (severity, reason, timestamp, admin) is persisted under `DataKey::RevocationRecord(wallet)`.
 
+**Re-revocation (issue #1393):** same-severity and ForCause→Routine calls return `ValidatorAlreadyRevoked`. Routine→ForCause escalation is allowed: the prior record is pushed to `RevocationHistory`, the original `revoked_at` is preserved, and any in-progress cascade cursor is not reset to 0. If the revocation drops `ActiveValidatorCount` below the configured milestone threshold, `milestone_threshold_unreachable` is emitted.
+
 **Breaking change (v1.0.0):** The old `reason: Option<String>` signature is replaced. The old string-equality-to-`"Routine"` severity inference is removed. All call sites must supply an explicit `severity`.
 
 | | |
 |---|---|
 | **Auth** | Admin must sign |
-| **Errors** | `ValidatorNotFound` · `ReasonTooLong` (reason > 128 bytes) · `Unauthorized` |
+| **Errors** | `ValidatorNotFound` · `ValidatorAlreadyRevoked` · `ReasonTooLong` (reason > 128 bytes) · `Unauthorized` |
 
 ```bash
 stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
@@ -1068,6 +1153,18 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
 
 ---
 
+#### `get_revocation_history(wallet: Address) -> Vec<RevocationRecord>`
+
+Return prior `RevocationRecord` entries preserved when a Routine revocation was
+escalated to ForCause. Empty if no escalation has occurred for this wallet.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Errors** | None |
+
+---
+
 #### `batch_revoke_validators(wallets: Vec<Address>, severity: RevocationSeverity, reason: Option<String>) -> Result<(), VerificationError>`
 
 Revoke multiple validators in a single atomic transaction. Applies the same
@@ -1081,7 +1178,7 @@ For `ForCause`, each validator's cascade sweep is started inline. Use `continue_
 | | |
 |---|---|
 | **Auth** | Admin must sign |
-| **Errors** | `ValidatorNotFound` · `ReasonTooLong` (reason > 128 bytes) · `Unauthorized` |
+| **Errors** | `ValidatorNotFound` · `ValidatorAlreadyRevoked` · `ReasonTooLong` (reason > 128 bytes) · `Unauthorized` |
 
 ```bash
 stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
@@ -1426,16 +1523,35 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
 
 Configure (admin only) or read the k-of-n distinct-active-validator threshold
 required before an `attest_milestone` claim commits. Must be in
-`[1, MAX_VALIDATORS]`. Defaults to `1` — see `approve_milestone` above for why.
+`[1, MAX_VALIDATORS]` **and** `<= ActiveValidatorCount`. Defaults to `1` —
+see `approve_milestone` above for why.
 An already-open claim keeps the threshold in effect when its current round
 started; changing this value only affects claims that start a fresh round
 afterward, so the admin cannot retroactively fast-track or invalidate an
-in-flight claim by moving the threshold mid-vote.
+in-flight claim by moving the threshold mid-vote. Lowering the global
+threshold does **not** rescue stuck claims that snapshotted a higher value.
+
+Emits `milestone_threshold_updated` on success. A revocation that leaves
+`ActiveValidatorCount < threshold` emits `milestone_threshold_unreachable`
+(revocation is still allowed — operators must lower the threshold or restore
+validators).
 
 | | |
 |---|---|
 | **Auth** | admin must sign (`set_milestone_threshold` only) |
-| **Errors** | `InvalidInput` (threshold is 0 or exceeds `MAX_VALIDATORS`) |
+| **Errors** | `InvalidInput` (threshold is 0 or exceeds `MAX_VALIDATORS`) · `ThresholdExceedsActiveValidators` (threshold > active set) |
+
+---
+
+#### `get_milestone_threshold_status() -> MilestoneThresholdStatus`
+
+Monitoring helper returning `{ threshold, active_validator_count, reachable }`
+where `reachable = active_validator_count >= threshold`.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Errors** | None |
 
 ---
 
@@ -2130,7 +2246,7 @@ Authorization works in two steps:
 | | |
 |---|---|
 | **Auth** | `player_wallet` must sign, and must match the wallet on record for `player_id` in the registration contract |
-| **Errors** | `ContractPaused` · `NotInitialized` · `MilestoneNotFound` · `Unauthorized` · `InvalidInput` (dispute already exists) · `RegistrationCallFailed` · `Overflow` |
+| **Errors** | `ContractPaused` · `NotInitialized` · `MilestoneNotFound` · `Unauthorized` · `DisputeAlreadyExists` (duplicate dispute for this milestone) · `RegistrationCallFailed` · `Overflow` |
 
 ```bash
 stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
@@ -2148,18 +2264,18 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
 
 Admin-only. Configure the jury escalation parameters. Changes only affect
 disputes filed **after** this call — in-flight disputes keep their snapshotted
-values.
+values. Emits `jury_config_updated`.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `impact_threshold` | 100 | Disputes with `impact_score >= threshold` are jury-routed |
-| `quorum` | 3 | Minimum distinct validator votes required for a jury outcome |
-| `voting_window_secs` | 604800 | Seconds after filing when the voting window closes (7 days) |
+| Parameter | Default | Bounds | Description |
+|-----------|---------|--------|-------------|
+| `impact_threshold` | 100 | any `u32` | Disputes with `impact_score >= threshold` are jury-routed |
+| `quorum` | 3 | `1..=MAX_VALIDATORS` and `<= ActiveValidatorCount` | Minimum distinct validator votes required for a jury outcome |
+| `voting_window_secs` | 604800 | `86400..=2592000` (1–30 days) | Seconds after filing when the voting window closes |
 
 | | |
 |---|---|
 | **Auth** | Admin must sign |
-| **Errors** | `ContractPaused` · `NotInitialized` · `Unauthorized` |
+| **Errors** | `ContractPaused` · `NotInitialized` · `Unauthorized` · `InvalidInput` (bounds) |
 
 ```bash
 stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
@@ -2663,28 +2779,28 @@ stellar contract invoke --id $PROGRESS_CONTRACT_ID \
 
 #### `get_progress_history(player_id: u64) -> Vec<ProgressEntry>`
 
-Return all history entries for a player in chronological order. The contract now
-stores the full logical history as bounded `HistoryPage(player_id, page_index)`
-shards (fixed-size pages, not one ever-growing `HistoryVec` key) and
-reconstructs the chronological list at read time. This keeps per-entry storage
-cost bounded even if a player experiences many resets or repeated re-entries.
+Return all history entries for a player in chronological order.
+
+**⚠️ DEPRECATED — Unbounded Cost**
+
+This function reads **every** `HistoryPage` shard for the player, so its CPU
+and storage cost grows linearly with the total history length. The previous
+documentation incorrectly claimed the cost was bounded by the page size; that
+was true only for the *write* path (`advance_level`), not for this full-history
+read.
+
+Additionally, this function previously extended the TTL of every page it
+touched, making a read call perform writes — an anti-pattern for query
+functions. The TTL extension has been removed.
+
+**Use the bounded alternatives instead:**
+- `get_progress_history_page` for offset-based pagination
+- `get_history_page_with_cursor` for stable cursor-based pagination
+
+This function is retained for backward compatibility but will be removed in a
+future major version. Prefer the paginated readers.
+
 Returns an empty `Vec` for unknown player IDs (default-on-absent, no error).
-Because an empty result is returned both for a registered player with no history
-and for an unknown `player_id`, verify existence against the registration
-contract (`registration.get_player(player_id)`) before interpreting the empty
-list, and distinguish "no level changes" from "player unknown" via that call.
-
-**Gas trade-off**: each page is a small, fixed-size `Vec<ProgressEntry>`, so the
-read cost scales with the number of pages touched rather than the total lifetime
-entry count in a single unbounded storage key. The logical history can still be
-reconstructed for Merkle commitments and auditing without exposing an
-unbounded per-player storage blob.
-
-**Migration note**: the legacy `HistoryVec(player_id)` key remains readable for
-compatibility with older deployments and recovery tooling, but new writes append
-to `HistoryPage` shards instead of extending the legacy vec. Existing data can
-still be recovered by concatenating the `HistoryEntry(player_id, i)` records in
-index order until a one-time migration is complete.
 
 | | |
 |---|---|
@@ -2856,16 +2972,28 @@ stellar contract invoke --id $PROGRESS_CONTRACT_ID \
 
 ---
 
-#### `get_history_since(player_id: u64, since_timestamp: u64) -> Vec<ProgressEntry>`
+#### `get_history_since(player_id: u64, since_timestamp: u64, limit: u32) -> Vec<ProgressEntry>`
 
-Return all of a player's history entries with `updated_at >= since_timestamp`
-(Unix seconds). Useful for indexers polling for changes since their last sync
-point instead of re-reading the full history.
+Return up to `limit` history entries for a player with `updated_at >=
+since_timestamp` (Unix seconds), starting from the **most recent** entries and
+working backwards.
 
-Returns an empty `Vec` for an unknown `player_id` (default-on-absent, no error)
-— the same empty result a registered player with no matching entries yields —
-so this getter does not assert existence. Confirm the player against the
-registration contract (`registration.get_player(player_id)`) when the empty
+**Bounded Cost**
+
+Unlike the previous unbounded implementation, this function scans at most
+`MAX_PAGES_SCAN` pages (10 pages = 80 entries with the current page size)
+starting from the newest page. This bounds CPU and storage cost to a fixed
+maximum regardless of total history length.
+
+`limit` is clamped to 1..=50. If more matching entries exist beyond the scanned
+pages, callers should use `get_history_page_with_cursor` with a snapshot taken
+at the desired timestamp for complete results.
+
+Returns an empty `Vec` if the player has no history or no entries match. An
+empty result is also returned for an unknown `player_id` (default-on-absent, no
+error) — the same empty result a registered player with no matching entries
+yields — so this getter does not assert existence. Confirm the player against
+the registration contract (`registration.get_player(player_id)`) when the empty
 result's cause matters.
 
 | | |
@@ -2875,7 +3003,7 @@ result's cause matters.
 
 ```bash
 stellar contract invoke --id $PROGRESS_CONTRACT_ID \
-  -- get_history_since --player_id 1 --since_timestamp 1700000000
+  -- get_history_since --player_id 1 --since_timestamp 1700000000 --limit 50
 ```
 
 ---
@@ -2956,6 +3084,17 @@ otherwise have to reimplement the tree construction off-chain — recomputed
 on demand, not stored (storing a proof per entry would require rewriting
 every prior entry's proof on each append). `verify_history_proof` accepts
 proofs from any source, not only this function.
+
+**⚠️ Unbounded Cost**
+
+This function reads **every** `HistoryPage` shard for the player and
+recomputes all leaf hashes to build the Merkle proof path. Its CPU and
+storage cost grows linearly with the total history length. For players
+with long histories, this can be expensive.
+
+For production use with large histories, consider computing proofs
+off-chain (e.g., in an indexer) using `get_progress_history_page` or
+`get_history_page_with_cursor` to fetch pages incrementally.
 
 | | |
 |---|---|
@@ -3641,10 +3780,14 @@ Emergency admin function to return `amount` XLM (stroops) from the contract
 balance to a scout. Use when a scout is accidentally double-charged (e.g. by
 the race condition the upgrade timing guard is designed to prevent).
 
+The scout must have an existing subscription record; refunds to addresses that
+have never subscribed are rejected with `ScoutNotSubscribed`. The admin address
+is included in the emitted `subscription_refunded` event for auditability.
+
 | | |
 |---|---|
 | **Auth** | Admin must sign |
-| **Errors** | `Unauthorized` · `InvalidInput` (amount ≤ 0) |
+| **Errors** | `Unauthorized` · `InvalidInput` (amount ≤ 0) · `ScoutNotSubscribed` (scout has no subscription record) · `InsufficientFee` (amount > contract balance) |
 
 ```bash
 stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
@@ -5146,8 +5289,8 @@ pub struct TrialOffer {
 | 22 | `InvalidAttestation` | ed25519 signature over the attestation payload failed, or its contract/network binding does not match this instance |
 | 23 | `AttestationKeyNotFound` | No attestation public key has been registered for this validator |
 | 24 | `InvalidNonce` | Attestation nonce already consumed or outside the bounded 256-nonce window |
-| 44 | `AttestationExpired` | Attestation `expires_at` timestamp is in the past relative to ledger time |
-| 45 | `AttestationWindowTooLarge` | Attestation `expires_at` exceeds `MAX_ATTESTATION_FUTURE_TOLERANCE_SECS` (3 600s) |
+| 45 | `AttestationExpired` | Attestation `expires_at` timestamp is in the past relative to ledger time |
+| 46 | `AttestationWindowTooLarge` | Attestation `expires_at` exceeds `MAX_ATTESTATION_FUTURE_TOLERANCE_SECS` (3 600s) |
 | 25 | `RegistrationCooldown` | Validator registration attempted before the cooldown window elapsed |
 | 26 | `DuplicateAttestation` | Same active validator attested to the same `(player_id, evidence_hash)` claim within its current voting round |
 | 27 | `TooManyPendingVotes` | Validator already has `MAX_PENDING_VOTES_PER_VALIDATOR` concurrent open attestation votes |
@@ -5167,6 +5310,8 @@ pub struct TrialOffer {
 | 41 | `AlreadyVoted` | `cast_dispute_vote` called by a validator who has already voted on this dispute |
 | 42 | `VotingWindowOpen` | `tally_dispute` called before the window closes with votes tied at or above quorum |
 | 43 | `QuorumNotReached` | `tally_dispute` called before the window closes and quorum not yet reached |
+| 44 | `ValidatorAlreadyRevoked` | `revoke_validator` / `batch_revoke_validators` on an inactive wallet without a permitted Routine → ForCause escalation |
+| 45 | `ThresholdExceedsActiveValidators` | `set_milestone_threshold` requested a value greater than `ActiveValidatorCount` |
 
 ### `ProgressError` (progress contract)
 
@@ -5229,8 +5374,8 @@ pub struct TrialOffer {
 | 36 | `PayToContactPaused` | `pay_to_contact` called while the function-scoped pause is active (issue #1056) — the whole-contract `ContractPaused` (3) takes precedence when both are set |
 | 37 | `TrialEscrowNotOutstanding` | `admin_refund_trial_escrow` targeted a `(player_id, offer_index)` pair with no outstanding `TrialEscrow` entry |
 | 38 | `GrantNotFound` | `admin_revoke_evidence_access` or `revoke_evidence_access` targeted a `(player_id, scout)` pair for which no `EvidenceAccessGrant` has ever been issued |
-| 39 | `GrantAlreadyRevoked` | `revoke_evidence_access` (player-initiated) targeted a grant that was already revoked |
-| 40 | `PlayerNotVerified` | `revoke_evidence_access` caller's wallet does not own the `player_id` passed, or the registration contract is not wired |
+| 42 | `GrantAlreadyRevoked` | `revoke_evidence_access` (player-initiated) targeted a grant that was already revoked |
+| 43 | `PlayerNotVerified` | `revoke_evidence_access` caller's wallet does not own the `player_id` passed, or the registration contract is not wired |
 
 ---
 
@@ -5251,7 +5396,7 @@ All events follow the unified `(Symbol, actor)` topic schema introduced in #246.
 | `player_deactivated` | event_name, admin (Address) | player_id (u64) | Admin soft-hides a player from filter results |
 | `player_reactivated` | event_name, admin (Address) | player_id (u64) | Admin restores a soft-hidden player to filter results |
 | `scout_verified` | event_name, wallet (Address) | scout_id (u64) | Admin verifies a scout |
-| `player_level_synced` | event_name, progress_contract (Address) | player_id (u64) | Progress contract syncs a player's level |
+| `player_level_synced` | event_name, progress_contract (Address) | (player_id (u64), level (ProgressLevel)) | Progress contract syncs a player's level to the given level |
 | `admin_transfer_proposed` | event_name, old_admin (Address) | new_admin (Address) | Current admin proposes a replacement |
 | `admin_transferred` | event_name, old_admin (Address) | new_admin (Address) | Pending admin accepts control |
 | `wiring_updated` | event_name, admin (Address), link (Symbol) | new_address (Address), new_epoch (u32) | `set_progress_contract` re-wired the `progress_contract` peer link (issue #1041 — see [Cross-Contract Wiring](#cross-contract-wiring) below) |
@@ -5260,6 +5405,8 @@ All events follow the unified `(Symbol, actor)` topic schema introduced in #246.
 | `player_record_restored` | event_name, admin (Address) | player_id (u64) | `restore_player_record` re-extended an archived player record's TTL |
 | `scout_record_restored` | event_name, admin (Address) | scout_id (u64) | `restore_scout_record` re-extended an archived scout record's TTL |
 | `migration_redeemed` | event_name, wallet (Address) | role (MigrationRole), profile_id (u64), new_contract_hint (Address) | A relayer-driven `redeem_migration_*` call seeded a historical player/scout profile |
+| `contract_paused` | event_name, admin (Address) | () | Circuit breaker engaged |
+| `contract_unpaused` | event_name, admin (Address) | () | Circuit breaker released |
 
 ### verification
 
@@ -5294,8 +5441,12 @@ All events follow the unified `(Symbol, actor)` topic schema introduced in #246.
 | `validator_record_restored` | event_name, admin (Address) | wallet (Address) | `restore_validator_record` re-extended an archived validator record's TTL |
 | `milestone_record_restored` | event_name, admin (Address) | player_id (u64), index (u32) | `restore_milestone_record` re-extended an archived milestone record's TTL |
 | `level_advancement_skipped` | event_name, player_id (u64) | reason (String) | A milestone was recorded but the Level-2+ advance was gated (region-quorum / affiliation-diversity not met) |
+| `level_advancement_deferred` | event_name, player_id (u64) | milestone_index (u32), distinct_affiliations (u32), required (u32) | A milestone was recorded but the level advance was deferred because the player has fewer distinct validator affiliations (`distinct_affiliations`) than the `required` DiversityConfig threshold — UIs can show "needs N more independent validator" |
 | `progress_contract_not_set` | event_name, player_id (u64) | () | Diagnostic: `approve_milestone` reached the cross-call point with no `progress_contract` wired |
 | `progress_call_failed` | event_name, player_id (u64) | error_code (u32) | Diagnostic (transaction receipt only): the cross-contract `advance_level` call returned an error, which aborts the whole transaction |
+| `jury_config_updated` | event_name, admin (Address) | old_impact (u32), old_quorum (u32), old_window (u64), new_impact (u32), new_quorum (u32), new_window (u64) | Admin updated jury escalation parameters via `set_jury_config` |
+| `milestone_threshold_updated` | event_name, admin (Address) | old_threshold (u32), new_threshold (u32) | Admin changed the k-of-n milestone approval threshold |
+| `milestone_threshold_unreachable` | event_name, admin (Address) | threshold (u32), active_validator_count (u32) | A revocation (or similar) left active validators below the configured threshold |
 
 ### progress
 
@@ -5323,7 +5474,7 @@ All events follow the unified `(Symbol, actor)` topic schema introduced in #246.
 | `trial_offer_confirmed` | event_name, scout (Address) | player_id (u64), index (u32) | Player confirms a pending trial offer before its expiry window closes; escrow released |
 | `trial_offer_expired` | event_name, scout (Address) | player_id (u64), index (u32) | Trial offer confirmation window elapsed; escrowed fee refunded to scout |
 | `fees_withdrawn` | event_name, admin (Address) | to (Address), amount (i128), timestamp (u64) | Admin withdraws accumulated fees |
-| `subscription_refunded` | event_name, scout (Address) | amount (i128) | Admin issues emergency refund to a scout |
+| `subscription_refunded` | event_name, scout (Address) | (admin (Address), amount (i128)) | Admin issues emergency refund to a scout |
 | `fee_config_updated` | event_name, admin (Address) | old_config (FeeConfig), new_config (FeeConfig) | Fee configuration changed (emitted by `update_fee_config`, `activate_fee_config`, and `propose_fee_config`'s immediate-decrease path) |
 | `fee_config_proposed` | event_name, admin (Address) | proposed_config (FeeConfig), proposed_at (u64) | Admin proposes a fee change via `propose_fee_config` — always emitted; also accompanied by `fee_config_updated` in the same transaction if the proposal was an immediate decrease |
 | `fee_config_delay_bypassed` | event_name, admin (Address) | old_config (FeeConfig), new_config (FeeConfig) | Emitted only by `update_fee_config`, alongside its own `fee_config_updated`, flagging that this fee change bypassed the 7-day `propose_fee_config`/`activate_fee_config` delay — see [`docs/FEE_CONFIG_PROPOSAL_DESIGN.md`](FEE_CONFIG_PROPOSAL_DESIGN.md#fee_config_delay_bypassed-new-1055) |
