@@ -10,7 +10,7 @@
 pub use scoutchain_registration::PlayerVitals;
 use scoutchain_registration::{RegistrationContract, RegistrationContractClient};
 use scoutchain_shared_types::ProgressLevel;
-use soroban_sdk::{testutils::Address as _, Address, Env, String, Vec};
+use soroban_sdk::{testutils::Address as _, Address, Bytes, Env, String, Vec};
 
 fn setup() -> (Env, RegistrationContractClient<'static>) {
     let env = Env::default();
@@ -71,7 +71,7 @@ fn test_filter_players_page_limit_enforced() {
         &String::from_str(&env, "WestAfrica"),
         &String::from_str(&env, "Forward"),
         &ProgressLevel::Unverified,
-        &0u32,
+        &Bytes::new(&env),
         &100u32,
     );
 
@@ -111,17 +111,17 @@ fn test_filter_players_pagination_retrieves_all() {
         &String::from_str(&env, "EastAfrica"),
         &String::from_str(&env, "Midfielder"),
         &ProgressLevel::Unverified,
-        &0u32,
+        &Bytes::new(&env),
         &50u32,
     );
     assert_eq!(page1.profiles.len(), 50, "page 1 must return 50 results");
-    assert!(page1.next_cursor > 0, "page 1 must indicate more results");
+    assert!(page1.has_more, "page 1 must indicate more results");
 
     let page2 = client.filter_players(
         &String::from_str(&env, "EastAfrica"),
         &String::from_str(&env, "Midfielder"),
         &ProgressLevel::Unverified,
-        &(page1.next_cursor as u32),
+        &page1.next_cursor,
         &50u32,
     );
     assert_eq!(
@@ -129,7 +129,7 @@ fn test_filter_players_pagination_retrieves_all() {
         10,
         "page 2 must return the remaining 10 results"
     );
-    assert_eq!(page2.next_cursor, 0, "page 2 must indicate no more results");
+    assert!(!page2.has_more, "page 2 must indicate no more results");
 
     // Total across both pages = 60.
     let total = page1.profiles.len() + page2.profiles.len();
@@ -161,7 +161,7 @@ fn test_filter_players_cpu_cost_at_50_results() {
         &String::from_str(&env, "SouthAfrica"),
         &String::from_str(&env, "Goalkeeper"),
         &ProgressLevel::Unverified,
-        &0u32,
+        &Bytes::new(&env),
         &50u32,
     );
     let cpu = env.cost_estimate().budget().cpu_instruction_cost();

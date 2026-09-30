@@ -53,6 +53,13 @@ const MAX_BATCH_SIZE: u32 = 20;
 const MAX_PLAYER_AGE: u32 = 100;
 const MAX_PLAYERS: u64 = 10_000;
 
+/// Maximum number of ledger entries scanned per `filter_players` call.
+/// Bounds CPU cost when the player set is large or heavily fragmented across
+/// level buckets.  If this budget is exhausted before all matching results are
+/// returned, `FilterResult.has_more` is set to `true` and a `next_cursor` is
+/// returned so the caller can resume on a subsequent call.
+const MAX_SCAN_PER_CALL: u32 = 200;
+
 /// Minimum scoutable age for player registration.
 /// Players younger than this age cannot be registered on the platform.
 /// Enforced by `register_player` to ensure off-chain age-gated scouting
@@ -1040,6 +1047,18 @@ impl RegistrationContract {
         Self::load_player(&env, player_id)
     }
 
+    /// Return just the `player_id` for a given wallet address, without loading
+    /// the full `PlayerProfile` (which requires a cross-contract call to the
+    /// progress contract for `level`). Used by the scout_access contract to
+    /// verify player ownership of an `EvidenceAccessGrant` without paying the
+    /// full-profile resolution cost.
+    pub fn get_player_id_by_wallet(env: Env, wallet: Address) -> Result<u64, ScoutChainError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PlayerByWallet(wallet))
+            .ok_or(ScoutChainError::PlayerNotFound)
+    }
+
     pub fn get_player_status(env: Env, player_id: u64) -> Result<PlayerStatus, ScoutChainError> {
         Self::load_stored_player(&env, player_id)?;
         if env
@@ -1220,29 +1239,35 @@ impl RegistrationContract {
     ///
     /// - Pass an empty string for `region` to match players in any region.
     /// - Pass an empty string for `position` to match players in any position.
-    /// - `offset` = 0 starts from the beginning; pass the previously returned
-    ///   `next_cursor` value as `offset` to fetch the next page.
-    ///   `next_cursor` = 0 in the response means no further results.
+    /// - `cursor` = empty bytes starts from the beginning; pass the previously
+    ///   returned `FilterResult.next_cursor` value to fetch the next page.
     /// - `limit` is capped at 50 internally.
     /// - Deactivated players (those with a `PlayerDeactivated` flag) are excluded
     ///   from results. Their profiles are still accessible via `get_player`.
     ///
-    /// `offset` is a count of eligible (non-deactivated, filter-matching)
-    /// entries to skip, NOT a player_id.  `next_cursor` is the count of
-    /// eligible entries processed across all pages so far, so passing it
-    /// back as `offset` on the next call correctly resumes from where
-    /// the previous page ended.
+    /// **Pagination model (id-based cursor):**
+    /// The cursor is an opaque `Bytes` encoding a resume point
+    /// `(level_index, last_player_id)`.  On each call the contract iterates the
+    /// `PlayersByLevel(level)` — or `PlayersByLevelRegion(level, region)` when a
+    /// region is supplied — buckets in ascending level order starting from the
+    /// cursor's `level_index`.  Within the cursor's level, all player IDs
+    /// `<= cursor.last_player_id` are skipped; all subsequent levels start from
+    /// ID 0.  This makes pagination stable across concurrent inserts and
+    /// deactivations: the cursor always points to a concrete player-ID boundary
+    /// so resumed calls never silently skip or duplicate entries.
     ///
-    /// When `region` is non-empty the composite `PlayersByLevelRegion` index is
-    /// used so only matching buckets are loaded.  When `region` is empty the
-    /// function falls back to a full `PlayerIndex` scan filtered by level and
-    /// position.
+    /// **Scan budget:** each call examines at most `MAX_SCAN_PER_CALL` ledger
+    /// entries (including deactivated / position-mismatched entries that are
+    /// skipped).  If the budget or the result cap is reached before all matching
+    /// players are returned, `has_more` is `true` and `next_cursor` is set so the
+    /// caller can resume.  If all levels are exhausted, `next_cursor` is empty
+    /// and `has_more` is `false`.
     pub fn filter_players(
         env: Env,
         region: String,
         position: String,
         min_level: ProgressLevel,
-        offset: u32,
+        cursor: Bytes,
         limit: u32,
     ) -> Result<FilterResult, ScoutChainError> {
         Self::require_initialized(&env)?;
@@ -1258,62 +1283,76 @@ impl RegistrationContract {
             ProgressLevel::EliteTier,
         ];
 
-        let mut results: Vec<PlayerProfile> = Vec::new(&env);
-        let mut next_cursor: u64 = 0;
-        // Number of eligible (non-deactivated, filter-matching) entries skipped so far.
-        let mut skipped: u32 = 0;
+        // Decode the opaque cursor (empty → start from the beginning).
+        let start_level_idx = Self::cursor_level_index(&cursor);
+        let resume_player_id = Self::cursor_last_player_id(&cursor);
 
-        if region_filter {
-            // Fast path: composite (level, region) index — only load matching buckets.
-            'outer: for level in levels.iter() {
-                if !Self::level_gte(level, &min_level) {
-                    continue;
-                }
-                let ids: Vec<u64> = env
-                    .storage()
+        let mut results: Vec<PlayerProfile> = Vec::new(&env);
+        let mut has_more = false;
+        // Last player_id examined in the index; used to encode the resume cursor.
+        let mut cursor_last_id: u64 = resume_player_id;
+        // Level index where the call stopped (for cursor encoding).
+        let mut stop_level_idx: usize = start_level_idx;
+        let mut scan_count: u32 = 0;
+        // Whether we've filled the result page and are now probing for `has_more`.
+        let mut limit_reached: bool = false;
+        // player_id of the last entry actually added to `results`.
+        let mut last_result_id: u64 = 0;
+        // Level where the last result was added (for cross-level cursor logic).
+        let mut last_result_level: usize = 0;
+
+        // Iterate level buckets in ascending order starting from the cursor level.
+        'outer: for level_idx in start_level_idx..levels.len() {
+            let level = &levels[level_idx];
+            stop_level_idx = level_idx;
+
+            if !Self::level_gte(level, &min_level) {
+                // Level is below the minimum — skip to the next one, resetting
+                // the per-level ID scan position.
+                cursor_last_id = 0;
+                continue;
+            }
+
+            let ids: Vec<u64> = if region_filter {
+                env.storage()
                     .persistent()
                     .get(&DataKey::PlayersByLevelRegion(
                         level.clone(),
                         region.clone(),
                     ))
-                    .unwrap_or_else(|| Vec::new(&env));
+                    .unwrap_or_else(|| Vec::new(&env))
+            } else {
+                // Region-less path: use PlayersByLevel index instead of a
+                // full PlayerIndex scan, so cost is proportional to matching
+                // levels rather than the entire player set.
+                env.storage()
+                    .persistent()
+                    .get(&DataKey::PlayersByLevel(level.clone()))
+                    .unwrap_or_else(|| Vec::new(&env))
+            };
 
-                for player_id in ids.iter() {
-                    // Skip deactivated players entirely (don't count toward offset).
-                    if env
-                        .storage()
-                        .persistent()
-                        .get::<DataKey, bool>(&DataKey::PlayerDeactivated(player_id))
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    if let Ok(profile) = Self::load_player(&env, player_id) {
-                        if position_filter && profile.vitals.position != position {
-                            continue;
-                        }
-                        if skipped < offset {
-                            skipped += 1;
-                            continue;
-                        }
-                        if results.len() >= max_results {
-                            next_cursor = (skipped + results.len()) as u64;
-                            break 'outer;
-                        }
-                        results.push_back(profile);
-                    }
+            let is_resume_level = level_idx == start_level_idx;
+
+            for player_id in ids.iter() {
+                scan_count += 1;
+
+                // Enforce scan budget.  The current entry has not been examined yet,
+                // so cursor_last_id still points to the previous (examined) entry.
+                if scan_count > MAX_SCAN_PER_CALL {
+                    has_more = true;
+                    break 'outer;
                 }
-            }
-        } else {
-            // Slow path: full PlayerIndex scan — needed when no region is specified.
-            let all_ids: Vec<u64> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::PlayerIndex)
-                .unwrap_or_else(|| Vec::new(&env));
 
-            for player_id in all_ids.iter() {
-                // Skip deactivated players entirely (don't count toward offset).
+                // In the cursor's level, skip IDs up to and including the
+                // resume point so we don't re-examine already-seen entries.
+                if is_resume_level && player_id <= resume_player_id {
+                    cursor_last_id = player_id;
+                    continue;
+                }
+
+                cursor_last_id = player_id;
+
+                // Skip deactivated players entirely (don't count toward results).
                 if env
                     .storage()
                     .persistent()
@@ -1322,29 +1361,58 @@ impl RegistrationContract {
                 {
                     continue;
                 }
+
                 if let Ok(profile) = Self::load_player(&env, player_id) {
-                    if !Self::level_gte(&profile.level, &min_level) {
-                        continue;
-                    }
                     if position_filter && profile.vitals.position != position {
                         continue;
                     }
-                    if skipped < offset {
-                        skipped += 1;
-                        continue;
+
+                    if !limit_reached {
+                        results.push_back(profile);
+                        last_result_id = player_id;
+                        last_result_level = level_idx;
+
+                        if results.len() >= max_results {
+                            limit_reached = true;
+                            // Continue scanning to probe whether more matching
+                            // entries exist, rather than optimistically setting
+                            // has_more = true.
+                        }
+                    } else {
+                        // Post-limit matching entry — there **are** more results.
+                        has_more = true;
+                        // Cursor must resume from the last result so the probe
+                        // entry and anything between it and the last result are
+                        // included in the next page.
+                        cursor_last_id = if level_idx == last_result_level {
+                            last_result_id
+                        } else {
+                            // Crossed into a new level: resume from the start
+                            // of this level so the probe entry is included.
+                            0
+                        };
+                        break 'outer;
                     }
-                    if results.len() >= max_results {
-                        next_cursor = (skipped + results.len()) as u64;
-                        break;
-                    }
-                    results.push_back(profile);
                 }
             }
+
+            // Finished this level's bucket — reset per-level ID for the next level.
+            cursor_last_id = 0;
         }
+
+        // If we exhausted all levels without hitting the budget, has_more
+        // accurately reflects whether a post-limit matching entry was found.
+        let next_cursor = if has_more {
+            Self::encode_cursor(&env, stop_level_idx as u32, cursor_last_id)
+        } else {
+            // All levels exhausted — return an empty cursor to signal completion.
+            Bytes::new(&env)
+        };
 
         Ok(FilterResult {
             profiles: results,
             next_cursor,
+            has_more,
         })
     }
 
@@ -1582,6 +1650,61 @@ impl RegistrationContract {
             ids.remove(pos as u32);
             env.storage().persistent().set(&key, &ids);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Cursor helpers for filter_players pagination
+    //
+    // The cursor is an opaque `Bytes` encoding `(level_index: u32, last_player_id: u64)`
+    // in big-endian (12 bytes total).  An empty cursor means "start from the
+    // beginning".  Using id-based cursors — instead of the old count-based offset —
+    // makes pagination stable across concurrent inserts and deactivations: a
+    // cursor always points to a concrete player_id boundary, so resumed calls
+    // never silently skip or duplicate entries.
+    // -------------------------------------------------------------------------
+
+    /// Encode a resume point as a 12-byte `Bytes`.
+    fn encode_cursor(env: &Env, level_index: u32, last_player_id: u64) -> Bytes {
+        let mut cursor = Bytes::new(env);
+        cursor.extend_from_array(&level_index.to_be_bytes());
+        cursor.extend_from_array(&last_player_id.to_be_bytes());
+        cursor
+    }
+
+    /// Decode the level index from a cursor.  Returns `0` for an empty cursor.
+    fn cursor_level_index(cursor: &Bytes) -> usize {
+        if cursor.len() < 4 {
+            return 0;
+        }
+        let b0 = cursor.get(0).unwrap_or(0) as u32;
+        let b1 = cursor.get(1).unwrap_or(0) as u32;
+        let b2 = cursor.get(2).unwrap_or(0) as u32;
+        let b3 = cursor.get(3).unwrap_or(0) as u32;
+        ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) as usize
+    }
+
+    /// Decode the last player_id processed from a cursor.  Returns `0` for an
+    /// empty cursor (meaning "no entries skipped yet").
+    fn cursor_last_player_id(cursor: &Bytes) -> u64 {
+        if cursor.len() < 12 {
+            return 0;
+        }
+        let b0 = cursor.get(4).unwrap_or(0) as u64;
+        let b1 = cursor.get(5).unwrap_or(0) as u64;
+        let b2 = cursor.get(6).unwrap_or(0) as u64;
+        let b3 = cursor.get(7).unwrap_or(0) as u64;
+        let b4 = cursor.get(8).unwrap_or(0) as u64;
+        let b5 = cursor.get(9).unwrap_or(0) as u64;
+        let b6 = cursor.get(10).unwrap_or(0) as u64;
+        let b7 = cursor.get(11).unwrap_or(0) as u64;
+        (b0 << 56)
+            | (b1 << 48)
+            | (b2 << 40)
+            | (b3 << 32)
+            | (b4 << 24)
+            | (b5 << 16)
+            | (b6 << 8)
+            | b7
     }
 }
 
@@ -2536,18 +2659,18 @@ mod tests {
         };
         client.register_player(&wallet3, &vitals3, &hashes);
 
-        // Filter: Forward in West Africa — offset=0
+        // Filter: Forward in West Africa — cursor = empty (start from beginning)
         let result = client.filter_players(
             &String::from_str(&env, "West Africa"),
             &String::from_str(&env, "Forward"),
             &ProgressLevel::Unverified,
-            &0u32,
+            &Bytes::new(&env),
             &20u32,
         );
 
         assert_eq!(result.profiles.len(), 1);
         assert_eq!(result.profiles.get(0).unwrap().player_id, 1);
-        assert_eq!(result.next_cursor, 0); // no more pages
+        assert!(!result.has_more); // no more pages
     }
 
     #[test]
@@ -2590,28 +2713,28 @@ mod tests {
             client.register_player(&wallet, &vitals, &hashes);
         }
 
-        // Page 1: offset=0, limit=4 → should return 4 Forwards
+        // Page 1: cursor = empty, limit=4 → should return 4 Forwards
         let page1 = client.filter_players(
             &String::from_str(&env, "West Africa"),
             &String::from_str(&env, "Forward"),
             &ProgressLevel::Unverified,
-            &0u32,
+            &Bytes::new(&env),
             &4u32,
         );
         assert_eq!(page1.profiles.len(), 4);
-        assert_ne!(page1.next_cursor, 0, "expected more pages");
+        assert!(page1.has_more, "expected more pages");
 
-        // Page 2: pass next_cursor from page1 as offset → remaining Forwards
+        // Page 2: pass next_cursor from page1 → remaining Forwards
         let page2 = client.filter_players(
             &String::from_str(&env, "West Africa"),
             &String::from_str(&env, "Forward"),
             &ProgressLevel::Unverified,
-            &(page1.next_cursor as u32),
+            &page1.next_cursor,
             &4u32,
         );
-        // 8 Forwards total, already skipped 4, so 4 more remain
+        // 8 Forwards total, already consumed 4, so 4 more remain
         assert_eq!(page2.profiles.len(), 4);
-        assert_eq!(page2.next_cursor, 0, "should be no more pages");
+        assert!(!page2.has_more, "should be no more pages");
     }
 
     // -------------------------------------------------------------------------
@@ -2663,7 +2786,7 @@ mod tests {
             &String::from_str(&env, "West Africa"), // region filter only
             &String::from_str(&env, ""),            // no position filter
             &ProgressLevel::Unverified,
-            &0u32,
+            &Bytes::new(&env),
             &20u32,
         );
 
@@ -2678,7 +2801,7 @@ mod tests {
         };
         assert!(returned_ids.contains(id_wa1), "id_wa1 must be in results");
         assert!(returned_ids.contains(id_wa2), "id_wa2 must be in results");
-        assert_eq!(result.next_cursor, 0);
+        assert!(!result.has_more);
     }
 
     /// filter_players with a region that has no registered players returns empty.
@@ -2705,7 +2828,7 @@ mod tests {
             &String::from_str(&env, "East Asia"), // region with no players
             &String::from_str(&env, ""),          // no position filter
             &ProgressLevel::Unverified,
-            &0u32,
+            &Bytes::new(&env),
             &20u32,
         );
 
@@ -2714,7 +2837,7 @@ mod tests {
             0,
             "no players in East Asia — must be empty"
         );
-        assert_eq!(result.next_cursor, 0);
+        assert!(!result.has_more);
     }
 
     // -------------------------------------------------------------------------
@@ -2754,7 +2877,7 @@ mod tests {
             &String::from_str(&env, "West Africa"),
             &String::from_str(&env, "Forward"),
             &ProgressLevel::Unverified,
-            &0u32,
+            &Bytes::new(&env),
             &20u32,
         );
         assert_eq!(result_before.profiles.len(), 2);
@@ -2767,7 +2890,7 @@ mod tests {
             &String::from_str(&env, "West Africa"),
             &String::from_str(&env, "Forward"),
             &ProgressLevel::Unverified,
-            &0u32,
+            &Bytes::new(&env),
             &20u32,
         );
         assert_eq!(result_after.profiles.len(), 1);
@@ -2819,7 +2942,7 @@ mod tests {
             &String::from_str(&env, "West Africa"),
             &String::from_str(&env, "Forward"),
             &ProgressLevel::Unverified,
-            &0u32,
+            &Bytes::new(&env),
             &20u32,
         );
         assert_eq!(result_deactivated.profiles.len(), 0);
@@ -2830,7 +2953,7 @@ mod tests {
             &String::from_str(&env, "West Africa"),
             &String::from_str(&env, "Forward"),
             &ProgressLevel::Unverified,
-            &0u32,
+            &Bytes::new(&env),
             &20u32,
         );
         assert_eq!(result_reactivated.profiles.len(), 1);
@@ -2845,14 +2968,15 @@ mod tests {
     // -------------------------------------------------------------------------
 
     /// Position filter before a page boundary must not cause silent gaps or
-    /// duplicates when following the documented next_cursor -> offset contract.
+    /// duplicates when following the documented next_cursor → next call contract.
     ///
     /// Concrete scenario: 5 Forwards, 1 Midfielder, 3 Forwards.
     /// Page 1 (limit=4) triggers a boundary at player 5 (Forward).
-    /// With the old bug, next_cursor was player_id 5, and passing it back
-    /// as offset (a count) skipped 5 eligible entries instead of 4 — losing
-    /// player 5.  The cursor is now a count of eligible entries processed,
-    /// so this gap cannot occur.
+    /// With the old count-based cursor, passing it back as offset could skip
+    /// eligible entries when non-matching players sat between pages.  The new
+    /// id-based cursor encodes `(level_index, last_player_id)` so the resume
+    /// point always refers to a concrete player-ID boundary — this gap cannot
+    /// occur.
     #[test]
     fn test_filter_players_pagination_cursor_no_gaps() {
         let (env, client) = setup();
@@ -2893,24 +3017,24 @@ mod tests {
             client.register_player(&wallet, &vitals, &hashes);
         }
 
-        // Walk through all pages using the documented cursor contract.
+        // Walk through all pages using the opaque cursor contract.
         let mut all_ids: Vec<u64> = Vec::new(&env);
-        let mut offset: u32 = 0;
+        let mut cursor: Bytes = Bytes::new(&env);
         loop {
             let page = client.filter_players(
                 &String::from_str(&env, "West Africa"),
                 &String::from_str(&env, "Forward"),
                 &ProgressLevel::Unverified,
-                &offset,
+                &cursor,
                 &4u32,
             );
             for i in 0..page.profiles.len() {
                 all_ids.push_back(page.profiles.get(i).unwrap().player_id);
             }
-            if page.next_cursor == 0 {
+            if !page.has_more {
                 break;
             }
-            offset = page.next_cursor as u32;
+            cursor = page.next_cursor;
         }
 
         // Must have exactly 8 Forwards with no gaps or duplicates.

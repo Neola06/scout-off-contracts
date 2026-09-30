@@ -134,6 +134,12 @@ pub enum ScoutAccessError {
     /// `admin_revoke_evidence_access` targeted a (player_id, scout) pair for
     /// which no `EvidenceAccessGrant` record exists.
     GrantNotFound = 38,
+    /// `revoke_evidence_access` attempted to revoke a grant that was already
+    /// revoked (by admin or player).
+    GrantAlreadyRevoked = 39,
+    /// `revoke_evidence_access` caller's wallet does not own the `player_id`
+    /// passed to the function, or the player is not registered.
+    PlayerNotVerified = 40,
 }
 
 impl AdminError for ScoutAccessError {
@@ -207,5 +213,15 @@ mod tests {
     #[test]
     fn grant_not_found_is_code_38() {
         assert_eq!(ScoutAccessError::GrantNotFound as u32, 38);
+    }
+
+    #[test]
+    fn grant_already_revoked_is_code_39() {
+        assert_eq!(ScoutAccessError::GrantAlreadyRevoked as u32, 39);
+    }
+
+    #[test]
+    fn player_not_verified_is_code_40() {
+        assert_eq!(ScoutAccessError::PlayerNotVerified as u32, 40);
     }
 }

@@ -27,10 +27,11 @@ The following functions are available in this contract. For complete documentati
 - `set_player_level(player_id: u64, level: ProgressLevel) -> Result<(), ScoutChainError>` — Update a player's stored `ProgressLevel`. Only callable by the registered progress contract address via cross-contract invocation.
 - `get_player(player_id: u64) -> Result<PlayerProfile, ScoutChainError>` — Retrieve the full player profile including wallet, vitals, IPFS hashes, and current progress level.
 - `get_player_by_wallet(wallet: Address) -> Result<PlayerProfile, ScoutChainError>` — Look up a player profile by their Stellar wallet address. Useful when the `player_id` is unknown.
+- `get_player_id_by_wallet(wallet: Address) -> Result<u64, ScoutChainError>` — Return just the `player_id` for a given wallet address, without loading the full profile (issue #1380). Used by `scout_access` to verify player ownership of evidence access grants.
 - `get_scout(scout_id: u64) -> Result<ScoutProfile, ScoutChainError>` — Retrieve a scout profile by ID.
 - `get_player_count() -> u64` — Return the total number of registered players. Returns `0` before the contract is initialized.
 - `get_scout_count() -> u64` — Return the total number of registered scouts. Returns `0` before the contract is initialized.
-- `filter_players(region: String, position: String, min_level: ProgressLevel) -> Result<Vec<PlayerProfile>, ScoutChainError>` — Scout discovery query. Returns up to 50 player profiles matching the given region, position, and minimum progress level.
+- `filter_players(region: String, position: String, min_level: ProgressLevel, cursor: Bytes, limit: u32) -> Result<FilterResult, ScoutChainError>` — Scout discovery query. Returns up to 50 player profiles matching the given region, position, and minimum progress level. Uses `PlayersByLevel` index with id-based cursor pagination and per-call scan budget.
 - `pause_contract() -> Result<(), ScoutChainError>` — Halt all state-changing operations (circuit breaker). Read-only queries remain available.
 - `unpause_contract() -> Result<(), ScoutChainError>` — Resume normal operations after a pause.
 - `health() -> ContractHealth` — Return the contract's initialization and pause status.

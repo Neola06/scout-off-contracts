@@ -100,13 +100,14 @@ pub fn filter_players(
     region: String,
     position: String,
     min_level: ProgressLevel,
-    offset: u32,
+    cursor: Bytes,
     limit: u32,
 ) -> Result<FilterResult, ScoutChainError>
 
 // Queries
 pub fn get_player(env: Env, player_id: u64) -> Result<PlayerProfile, ScoutChainError>
 pub fn get_player_by_wallet(env: Env, wallet: Address) -> Result<PlayerProfile, ScoutChainError>
+pub fn get_player_id_by_wallet(env: Env, wallet: Address) -> Result<u64, ScoutChainError>
 pub fn get_scout(env: Env, scout_id: u64) -> Result<ScoutProfile, ScoutChainError>
 pub fn get_player_count(env: Env) -> u64
 pub fn get_scout_count(env: Env) -> u64
@@ -302,12 +303,15 @@ pub fn confirm_trial_offer(
     idempotency_nonce: Option<String>,
 ) -> Result<(), ScoutAccessError>
 
-// Queries
+ // Queries
 pub fn get_subscription(env: Env, scout: Address) -> Result<Subscription, ScoutAccessError>
 pub fn get_fee_config(env: Env) -> FeeConfig
 pub fn has_contacted(env: Env, scout: Address, player_id: u64) -> bool
 pub fn get_trial_offer(env: Env, player_id: u64, index: u32) -> Result<TrialOffer, ScoutAccessError>
 pub fn get_trial_count(env: Env, player_id: u64) -> u32
+pub fn has_evidence_access(env: Env, player_id: u64, scout: Address) -> bool
+pub fn get_evidence_access_grant(env: Env, player_id: u64, scout: Address) -> Option<EvidenceAccessGrant>
+pub fn get_player_access_grants(env: Env, player_id: u64, offset: u32, limit: u32) -> Vec<EvidenceAccessGrant>
 pub fn health(env: Env) -> ContractHealth
 pub fn version(env: Env) -> String
 
@@ -316,11 +320,21 @@ pub fn update_fee_config(env: Env, fee_config: FeeConfig) -> Result<(), ScoutAcc
 pub fn withdraw_fees(env: Env, to: Address) -> Result<i128, ScoutAccessError>
 pub fn set_progress_contract(env: Env, addr: Address) -> Result<(), ScoutAccessError>
 pub fn update_progress_contract(env: Env, addr: Address) -> Result<(), ScoutAccessError>
+pub fn set_registration_contract(env: Env, addr: Address) -> Result<(), ScoutAccessError>
+pub fn admin_revoke_evidence_access(env: Env, player_id: u64, scout: Address) -> Result<(), ScoutAccessError>
 pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), ScoutAccessError>
 pub fn accept_admin(env: Env) -> Result<(), ScoutAccessError>
 pub fn pause_contract(env: Env) -> Result<(), ScoutAccessError>
 pub fn unpause_contract(env: Env) -> Result<(), ScoutAccessError>
 pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), ScoutAccessError>
+
+// Player-initiated (issue #1380)
+pub fn revoke_evidence_access(
+    env: Env,
+    player: Address,
+    player_id: u64,
+    scout: Address,
+) -> Result<(), ScoutAccessError>
 ```
 
 ---
@@ -482,7 +496,9 @@ Error codes are **per-contract**. The same numeric code can mean different thing
 | 21 | `SpecializationMismatch` | Validator not tagged for requested milestone category |
 | 22 | `InvalidAttestation` | ed25519 signature verification failed |
 | 23 | `AttestationKeyNotFound` | No attestation public key registered |
-| 24 | `InvalidNonce` | Nonce not strictly greater than last accepted |
+| 24 | `InvalidNonce` | Attestation nonce already consumed or outside the bounded 256-nonce window |
+| 44 | `AttestationExpired` | Attestation `expires_at` is in the past |
+| 45 | `AttestationWindowTooLarge` | Attestation `expires_at` exceeds the max-future tolerance |
 | 25 | `RegistrationCooldown` | Validator registration before cooldown window elapsed |
 | 26 | `DuplicateAttestation` | Same validator already attested to this claim in current round |
 | 27 | `TooManyPendingVotes` | Validator has MAX_PENDING_VOTES_PER_VALIDATOR outstanding votes |
@@ -563,7 +579,9 @@ Error codes are **per-contract**. The same numeric code can mean different thing
 | 35 | `SubscriptionRecordEvicted` | Subscription record fully evicted, unrecoverable |
 | 36 | `PayToContactPaused` | `pay_to_contact` function is paused independently of whole-contract pause |
 | 37 | `TrialEscrowNotOutstanding` | `admin_refund_trial_escrow` targeted pair with no outstanding `TrialEscrow` entry |
-| 38 | `GrantNotFound` | `admin_revoke_evidence_access` targeted (player_id, scout) pair with no `EvidenceAccessGrant` record |
+| 38 | `GrantNotFound` | `admin_revoke_evidence_access` or `revoke_evidence_access` targeted (player_id, scout) pair with no `EvidenceAccessGrant` record |
+| 39 | `GrantAlreadyRevoked` | `revoke_evidence_access` (player-initiated) targeted a grant that was already revoked |
+| 40 | `PlayerNotVerified` | `revoke_evidence_access` caller's wallet does not own the `player_id` passed, or the registration contract is not wired |
 
 ---
 
@@ -696,7 +714,7 @@ When the progress contract is not wired, a `progress_contract_not_set` event is 
 - **Admin rotation is two-step.** Current admin calls `propose_admin`, then the pending address calls `accept_admin`. The old admin remains active until acceptance.
 - **Error codes are per-contract, not global.** Code `4` means `Unauthorized` in verification but also `Unauthorized` (different context) in scout_access. Code `9` means `ContractPaused` in registration but `RegistrationCallFailed` in progress. Always check which contract returned the error.
 - **Subscription tier check is enforced on-chain.** Basic scouts cannot call `pay_to_contact`. Elite is required for `log_trial_offer`.
-- **`filter_players` requires `offset` and `limit`.** The limit is capped at 50 server-side.
+- **`filter_players` requires `cursor` and `limit`.** The limit is capped at 50 server-side. `cursor` is an opaque `Bytes` token; pass an empty `Bytes` on the first call and the returned `next_cursor` on subsequent calls.
 - **`set_progress_contract` on verification is first-call-only.** Returns `AlreadyConfigured` (code 11) if called again. Use `update_progress_contract` to re-wire.
 - **`approve_milestone` stops working once k-of-n threshold mode is enabled.** Once an admin calls `set_milestone_threshold(n)` with `n >= 2`, both `approve_milestone` and `submit_attested_milestone` return `ThresholdModeRequiresAttestation` (code 28) for every subsequent call — all milestone submissions must go through `attest_milestone` instead. Call `get_milestone_threshold()` to check the current mode before integrating; a return value of `1` (the default) means single-signature mode is still active and `approve_milestone` works as normal. A return value of `2` or higher means every validator must call `attest_milestone` independently, and the milestone commits automatically once the threshold number of distinct active validators have voted for the same `(player_id, evidence_hash)` claim within the configured voting window.
 

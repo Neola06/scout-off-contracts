@@ -395,6 +395,24 @@ stellar contract invoke --id $REGISTRATION_CONTRACT_ID \
 
 ---
 
+#### `get_player_id_by_wallet(wallet: Address) -> Result<u64, ScoutChainError>`
+
+Resolve a wallet `Address` to its `player_id` via the `DataKey::PlayerByWallet`
+index. Used by `scout_access.revoke_evidence_access` to verify that the
+caller owns the `player_id` passed as an argument (issue #1380).
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Errors** | `PlayerNotFound` (scout_access `RegClientError` code 3) |
+
+```bash
+stellar contract invoke --id $REGISTRATION_CONTRACT_ID \
+  -- get_player_id_by_wallet --wallet $PLAYER_WALLET
+```
+
+---
+
 #### `get_scout_verification(scout_id: u64) -> Result<ScoutVerificationRecord, ScoutChainError>`
 
 Retrieve just the structured verification record (`verified`, `verified_by`,
@@ -478,36 +496,38 @@ stellar contract invoke --id $REGISTRATION_CONTRACT_ID -- get_scout_count
 
 ---
 
-#### `filter_players(region: String, position: String, min_level: ProgressLevel, offset: u32, limit: u32) -> Result<FilterResult, ScoutChainError>`
+#### `filter_players(region: String, position: String, min_level: ProgressLevel, cursor: Bytes, limit: u32) -> Result<FilterResult, ScoutChainError>`
 
 Scout discovery query. Returns up to 50 player profiles matching the given
 region, position, and minimum progress level.
 
-Uses the composite `PlayersByLevelRegion(level, region)` index as the entry
-point so only players that already satisfy the level+region criteria are loaded.
-Gas cost is proportional to the number of matching players, not the total player
-count. The index is maintained automatically on `register_player`,
-`set_player_level`, and `deregister_player`.
+Uses the `PlayersByLevel(level)` index (or the composite
+`PlayersByLevelRegion(level, region)` index when a region is supplied) as the
+entry point so only players at or above `min_level` are loaded.  When `region`
+is empty, the region-less path iterates `PlayersByLevel` buckets for each level
+`>= min_level` instead of scanning the full `PlayerIndex`, keeping gas cost
+proportional to matching levels rather than total player count.  The index is
+maintained automatically on `register_player`, `set_player_level`, and
+`deregister_player`.
 
 Pagination:
-- `offset` = 0 starts from the beginning.
-- Pass the previously returned `FilterResult.next_cursor` value as `offset` to
+- `cursor` = empty bytes starts from the beginning (first call).
+- Pass the previously returned `FilterResult.next_cursor` value as `cursor` to
   fetch the next page.
-- `next_cursor` = 0 in the response means no further results.
-- Both `offset` and `next_cursor` are *counts* of eligible (non-deactivated,
-  filter-matching) entries, not player IDs.
+- An empty `next_cursor` (with `has_more = false`) means no further results.
+- The cursor is an opaque `Bytes` encoding `(level_index: u32, last_player_id: u64)`.
+  It is **id-based**, not count-based, so pagination is stable across concurrent
+  inserts and deactivations.
 
-> **Past bug (#1017):** `next_cursor` used to be set to the raw `player_id` of
-> the last entry on the page while `offset` was always compared as a count of
-> eligible entries — different units that only coincided by accident when
-> player IDs were contiguous with no filter gaps. Paginating past a
-> non-matching player (e.g. a different position) between pages would skip
-> one eligible entry per such gap. Fixed by making `next_cursor` a count in
-> the same unit as `offset`, matching the contract documented above; both
-> code paths (the region-filtered fast path and the full-scan slow path) and
-> their doc comments were updated together, and a regression test
-> (`test_filter_players_pagination_cursor_no_gaps`) walks a filtered page
-> boundary to assert no entries are skipped or duplicated.
+> **Bug fix (#1378):** The region-less path previously performed a full
+> `PlayerIndex` scan (O(n) over all registered players) and used a count-based
+> `offset` cursor that could skip or duplicate entries when the underlying index
+> shifted due to concurrent inserts or deactivations.  The path now iterates
+> `PlayersByLevel` buckets and uses an id-based cursor encoding
+> `(level_index, last_player_id)`, making pagination stable.  A per-call scan
+> budget (`MAX_SCAN_PER_CALL = 200`) bounds CPU cost; if the budget is exhausted
+> before all matching results are returned, `has_more` is `true` and a resume
+> cursor is returned.
 
 | | |
 |---|---|
@@ -520,7 +540,7 @@ stellar contract invoke --id $REGISTRATION_CONTRACT_ID \
   --region '"West Africa"' \
   --position '"Forward"' \
   --min_level '"Unverified"' \
-  --offset 0 \
+  --cursor '[]' \
   --limit 50
 ```
 
@@ -2377,7 +2397,7 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID -- version
 | `unpause_approve_milestone() -> Result<(), VerificationError>` | admin | Release the `approve_milestone` function-scoped breaker. Emits `approve_milestone_unpaused`. |
 | `register_attestation_key(wallet, public_key: BytesN<32>) -> Result<(), VerificationError>` | self | A validator registers the ed25519 public key used to verify their off-chain-signed attestations. |
 | `submit_attested_milestone(relayer, attestation: MilestoneAttestation, signature: BytesN<64>) -> Result<u32, VerificationError>` | relayer | Relayer submits a validator's off-chain-signed milestone attestation; the relayer pays fees but holds no privilege. |
-| `get_attestation_nonce(wallet) -> u64` | none | Current replay-protection nonce for a validator's attestation key. |
+| `get_attestation_nonce(wallet) -> u64` | none | Highest accepted attestation nonce for a validator (computed from the 256-bit bitmap base + highest set bit; 0 if none) |
 | `get_attestation_key(wallet) -> Result<BytesN<32>, VerificationError>` | none | Read a validator's registered attestation public key. |
 | `get_milestone_with_status(player_id, index) -> Result<MilestoneWithValidatorStatus, VerificationError>` | none | A milestone plus whether its approving validator is still active. |
 | `get_milestones_by_validator_page(wallet, offset: u32, limit: u32) -> Vec<Milestone>` | none | Paginated list of milestones approved by a given validator. |
@@ -3119,13 +3139,16 @@ this is an append-only fact rather than a live entitlement check.
 | `player_id` | `u64` | Player whose evidence this grant authorizes access to. |
 | `scout` | `Address` | Scout wallet authorized by this grant. |
 | `granted_at` | `u64` | Unix-seconds ledger timestamp when the grant was issued. |
+| `expires_at` | `u64` | Unix-seconds ledger timestamp at which the grant expires. `has_evidence_access` returns `false` once the ledger time exceeds this value. Set to `granted_at + 90 days`. |
 | `tier_at_grant` | `SubscriptionTier` | The scout's subscription tier at the moment of issuance. Recorded for audit only; not re-checked afterward. |
-| `revoked` | `bool` | `true` once `admin_revoke_evidence_access` has been called for this grant. |
+| `revoked` | `bool` | `true` once a grant has been revoked via `admin_revoke_evidence_access` (admin) or `revoke_evidence_access` (player-initiated). |
 | `revoked_at` | `Option<u64>` | Unix-seconds ledger timestamp of revocation, if any. |
 
 Written exactly once, atomically, by a successful `pay_to_contact` or
 `batch_contact_players` call — never on a rejected call. Never deleted;
-`admin_revoke_evidence_access` only flips `revoked`/`revoked_at`.
+`admin_revoke_evidence_access` and `revoke_evidence_access` only flip
+`revoked`/`revoked_at`. After `expires_at`, the grant record is retained
+for audit but `has_evidence_access` returns `false`.
 
 > [!NOTE]
 > **Historical Fee Configs & Auditability**
@@ -4610,10 +4633,11 @@ stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
 
 #### `has_evidence_access(player_id: u64, scout: Address) -> bool`
 
-Return `true` if `scout` currently holds a non-revoked `EvidenceAccessGrant`
-for `player_id`. This is the fast check the off-chain key-wrapping service
-should call before honoring a wrapped-key request. See
-[EVIDENCE_PRIVACY.md](EVIDENCE_PRIVACY.md).
+Return `true` if `scout` currently holds a non-revoked, non-expired
+`EvidenceAccessGrant` for `player_id`. This is the fast check the off-chain
+key-wrapping service should call before honoring a wrapped-key request.
+Returns `false` if no grant exists, the grant is revoked, or the grant's
+`expires_at` has passed. See [EVIDENCE_PRIVACY.md](EVIDENCE_PRIVACY.md).
 
 | | |
 |---|---|
@@ -4687,6 +4711,27 @@ event or changing `revoked_at`.
 ```bash
 stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
   -- admin_revoke_evidence_access --player_id 1 --scout $SCOUT_ADDRESS
+```
+
+---
+
+#### `revoke_evidence_access(player: Address, player_id: u64, scout: Address) -> Result<(), ScoutAccessError>`
+
+Player-initiated revocation of an evidence access grant (issue #1380).
+The caller (`player`) authenticates; their ownership of `player_id` is
+verified through the registration contract's `get_player_id_by_wallet`
+cross-contract call. Like `admin_revoke_evidence_access`, this does not
+delete the grant record — only flips `revoked`/`revoked_at`. Emits
+`evidence_access_revoked_by_player`.
+
+| | |
+|---|---|
+| **Auth** | `player` must sign; player must own `player_id` per the registration contract |
+| **Errors** | `NotInitialized` · `ContractPaused` · `GrantNotFound` · `GrantAlreadyRevoked` · `PlayerNotVerified` |
+
+```bash
+stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
+  -- revoke_evidence_access --player $PLAYER_WALLET --player_id 1 --scout $SCOUT_ADDRESS
 ```
 
 ---
@@ -5100,7 +5145,9 @@ pub struct TrialOffer {
 | 21 | `SpecializationMismatch` | `milestone_category` supplied to `approve_milestone` but the validator is not tagged for that category |
 | 22 | `InvalidAttestation` | ed25519 signature over the attestation payload failed, or its contract/network binding does not match this instance |
 | 23 | `AttestationKeyNotFound` | No attestation public key has been registered for this validator |
-| 24 | `InvalidNonce` | Attestation nonce is not strictly greater than the last accepted nonce |
+| 24 | `InvalidNonce` | Attestation nonce already consumed or outside the bounded 256-nonce window |
+| 44 | `AttestationExpired` | Attestation `expires_at` timestamp is in the past relative to ledger time |
+| 45 | `AttestationWindowTooLarge` | Attestation `expires_at` exceeds `MAX_ATTESTATION_FUTURE_TOLERANCE_SECS` (3 600s) |
 | 25 | `RegistrationCooldown` | Validator registration attempted before the cooldown window elapsed |
 | 26 | `DuplicateAttestation` | Same active validator attested to the same `(player_id, evidence_hash)` claim within its current voting round |
 | 27 | `TooManyPendingVotes` | Validator already has `MAX_PENDING_VOTES_PER_VALIDATOR` concurrent open attestation votes |
@@ -5181,7 +5228,9 @@ pub struct TrialOffer {
 | 35 | `SubscriptionRecordEvicted` | `restore_subscription_record` targeted a subscription entry whose archival grace period has fully elapsed (evicted, not merely archived) and is unrecoverable |
 | 36 | `PayToContactPaused` | `pay_to_contact` called while the function-scoped pause is active (issue #1056) — the whole-contract `ContractPaused` (3) takes precedence when both are set |
 | 37 | `TrialEscrowNotOutstanding` | `admin_refund_trial_escrow` targeted a `(player_id, offer_index)` pair with no outstanding `TrialEscrow` entry |
-| 38 | `GrantNotFound` | `admin_revoke_evidence_access` targeted a `(player_id, scout)` pair for which no `EvidenceAccessGrant` has ever been issued |
+| 38 | `GrantNotFound` | `admin_revoke_evidence_access` or `revoke_evidence_access` targeted a `(player_id, scout)` pair for which no `EvidenceAccessGrant` has ever been issued |
+| 39 | `GrantAlreadyRevoked` | `revoke_evidence_access` (player-initiated) targeted a grant that was already revoked |
+| 40 | `PlayerNotVerified` | `revoke_evidence_access` caller's wallet does not own the `player_id` passed, or the registration contract is not wired |
 
 ---
 
@@ -5289,6 +5338,7 @@ All events follow the unified `(Symbol, actor)` topic schema introduced in #246.
 | `subscription_record_restored` | event_name, admin (Address) | scout (Address) | `restore_subscription_record` re-extends an archived or expired subscription entry's TTL back to the policy value |
 | `evidence_access_granted` | event_name, scout (Address) | player_id (u64), tier_at_grant (SubscriptionTier) | `pay_to_contact` / `batch_contact_players` atomically authorizes this scout to request the wrapped decryption key for this player's evidence — see [EVIDENCE_PRIVACY.md](EVIDENCE_PRIVACY.md) |
 | `evidence_access_revoked` | event_name, scout (Address) | player_id (u64), admin (Address) | `admin_revoke_evidence_access` — off-chain key-wrapping service should stop honoring *future* requests for this pair |
+| `evidence_access_revoked_by_player` | event_name, scout (Address) | player_id (u64), player (Address) | `revoke_evidence_access` (issue #1380) — player-initiated revocation; key-wrapping service should stop honoring *future* requests for this pair |
 | `auto_renew_set` | event_name, scout (Address) | enabled (bool) | Scout toggled auto-renewal of their subscription |
 | `subscription_auto_renewed` | event_name, scout (Address) | tier (SubscriptionTier), subscribed_at (u64), expires_at (u64) | `renew_if_due` auto-renewed a scout's subscription |
 | `trial_escrow_admin_refunded` | event_name, to (Address) | player_id (u64), index (u32), amount (i128) | `admin_refund_trial_escrow` force-refunded a stuck trial-offer escrow to a scout |

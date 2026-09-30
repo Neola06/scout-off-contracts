@@ -13,7 +13,7 @@
 
 use scoutchain_registration::{PlayerVitals, RegistrationContract, RegistrationContractClient};
 use scoutchain_shared_types::ProgressLevel;
-use soroban_sdk::{testutils::Address as _, vec, Address, Env, String};
+use soroban_sdk::{testutils::Address as _, vec, Address, Bytes, Env, String};
 
 const REGISTER_PLAYER_CPU_BUDGET: u64 = 452_787;
 const UPDATE_PROFILE_CPU_BUDGET: u64 = 193_686;
@@ -99,7 +99,7 @@ fn cost_filter_players() {
         &region,
         &String::from_str(&env, ""),
         &ProgressLevel::Unverified,
-        &0u32,
+        &Bytes::new(&env),
         &20u32,
     );
     assert_cpu_budget(&env, "filter_players", FILTER_PLAYERS_CPU_BUDGET);

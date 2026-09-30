@@ -105,15 +105,25 @@ pub struct PlayerSummary {
 }
 
 /// Paginated response from filter_players.
-/// `next_cursor` is `0` when there are no more results.
+///
+/// `next_cursor` is an opaque `Bytes` value.  An empty (zero-length) cursor
+/// means there are no more results — pass it back as `cursor` on the next call
+/// to signal "start from the beginning" or simply stop paging.
+///
+/// The cursor encodes a resume point as `(level_index: u32, last_player_id: u64)`
+/// in big-endian bytes (12 bytes total).  This id-based cursor is stable across
+/// concurrent inserts and deactivations, unlike the old count-based `offset`
+/// which could skip or duplicate entries when the underlying index shifted.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct FilterResult {
     /// Page of player profiles matching the supplied filter criteria.
     pub profiles: Vec<PlayerProfile>,
-    /// Pass this value as `offset` in the next call to continue pagination.
-    /// A value of `0` means there are no further results.
-    pub next_cursor: u64,
+    /// Opaque cursor for resuming pagination.  Empty when `has_more` is
+    /// `false` (no further results).
+    pub next_cursor: Bytes,
+    /// Whether more results exist beyond this page.
+    pub has_more: bool,
 }
 
 /// Direct status for a registered player.

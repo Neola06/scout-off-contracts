@@ -1,6 +1,8 @@
 # Rust / Cargo
 target/
 Cargo.lock
+*.wasm
+*.optimized.wasm
 
 # Environment secrets — never commit these
 .env
@@ -9,10 +11,6 @@ Cargo.lock
 
 # Migration state exports (may contain player PII) — never commit these
 migration-export/
-
-# Optimized WASM outputs
-*.optimized.wasm
-*.wasm
 
 # OS
 .DS_Store
@@ -56,22 +54,8 @@ package-lock.json
 yarn.lock
 pnpm-lock.yaml
 
-# Compiled WASM artifacts
-*.wasm
-
 # Log files
 *.log
-
-# Test snapshots
-*.snap
-*.snap.new
-**/__snapshots__/
-**/snapshots/
-
-# Temporary files
-*.tmp
-*.bak
-*.orig
 
 # Calibration artifacts (local only)
 calibration-report.json

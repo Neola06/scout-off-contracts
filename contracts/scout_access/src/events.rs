@@ -358,3 +358,27 @@ pub fn evidence_access_revoked(env: &Env, player_id: u64, scout: &Address, admin
         (player_id, admin.clone()),
     );
 }
+
+pub const EVIDENCE_ACCESS_REVOKED_BY_PLAYER: &str = "evidence_access_revoked_by_player";
+
+/// topics: (event_name, scout)  data: (player_id, player)
+///
+/// Emitted by `revoke_evidence_access` (player-initiated). Like
+/// `evidence_access_revoked` (admin path), this only instructs the off-chain
+/// key-wrapping service to stop honoring *future* key-wrap requests for
+/// this (player_id, scout) pair — it cannot claw back a wrapped key already
+/// delivered before this event.
+pub fn evidence_access_revoked_by_player(
+    env: &Env,
+    player_id: u64,
+    scout: &Address,
+    player: &Address,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, EVIDENCE_ACCESS_REVOKED_BY_PLAYER),
+            scout.clone(),
+        ),
+        (player_id, player.clone()),
+    );
+}

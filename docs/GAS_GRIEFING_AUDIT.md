@@ -113,27 +113,42 @@ the validator set is admin-gated so churn requires admin action each time.
 
 ### Mitigation
 
-`filter_players` caps its result set at **50 entries per call** (`limit.min(50)`).
-This bounds the per-call work to O(50) profile reads regardless of how many players
-are in the index. Callers paginate through subsequent calls.
+`filter_players` now caps its result set at **50 entries per call**
+(`limit.min(50)`) **and** enforces a per-call scan budget of
+`MAX_SCAN_PER_CALL = 200` ledger entries examined.  This bounds the per-call
+work to O(200) index entries regardless of how many players are in the bucket,
+so even a 1,000-player spam bucket cannot inflate a single scout's query cost
+beyond 200 entry scans.  Callers paginate through subsequent calls using the
+opaque id-based cursor (`FilterResult.next_cursor`).
 
-**Important nuance:** The index scan itself may be larger than 50 because the function
-skips deactivated players and applies position/level filters before the limit is
-applied. In the worst case (all registered players are in the bucket but none match
-the position filter), the function scans the full bucket.
+**Important nuance:** The index scan budget (200) is larger than the result
+cap (50) to allow for deactivation and position/level filters that skip
+non-matching entries.  In the worst case (all registered players are in the
+bucket but none match the position filter), the function scans up to
+`MAX_SCAN_PER_CALL` entries before returning `has_more = true` with a resume
+cursor.
 
 **Accepted residual risk:** A targeted spam attack flooding one specific
-`(level, region)` bucket could inflate the scan cost for that bucket beyond 50
-iterations before the limit applies. At realistic scale (each registration costs a
-transaction fee), this requires non-trivial attacker spend. This is documented as an
-accepted risk at current fee levels; a registration fee or CAPTCHA on the off-chain
-layer is the correct long-term mitigation, not a contract change.
+`(level, region)` bucket could require more paginated calls than a clean
+bucket, but each call's cost is bounded by `MAX_SCAN_PER_CALL`.  At realistic
+scale (each registration costs a transaction fee), this requires non-trivial
+attacker spend. This is documented as an accepted risk at current fee levels;
+a registration fee or CAPTCHA on the off-chain layer is the correct long-term
+mitigation, not a contract change.
 
 ### Regression test
 
-`contracts/registration/tests/gas_griefing_regression.rs`  
+`contracts/registration/tests/gas_griefing_regression.rs`
 - `test_filter_players_page_limit_enforced` — registers 60 players in one bucket,
   calls `filter_players` with `limit=100`, asserts at most 50 results are returned.
+- `test_filter_players_pagination_retrieves_all` — registers 60 players, paginates
+  through all pages using the opaque id-based cursor, asserts all 60 are retrieved.
+- `test_filter_players_cpu_cost_at_50_results` — registers 50 players, measures CPU
+  cost of `filter_players`, asserts it stays within the 15M instruction budget.
+
+`contracts/registration/tests/cost_budget.rs`
+- `cost_filter_players` — measures CPU cost of `filter_players` against the
+  checked-in `FILTER_PLAYERS_CPU_BUDGET` constant.
 
 ---
 
@@ -255,7 +270,7 @@ Documented as accepted at current fee levels.
 | Vector | This audit (griefing/asymmetric cost) | Scalability issue (absolute cost) |
 |--------|--------------------------------------|-----------------------------------|
 | ValidatorVector growth | Cap at 100 bounds O(N) scan victim cost | Separate: upgrading cap requires contract upgrade |
-| filter_players spam | Per-call limit=50 bounds each scout's cost | Separate: index restructuring for O(1) lookups |
+| filter_players spam | Scan budget (MAX_SCAN_PER_CALL=200) + result cap 50 bounds each scout's cost | Scan budget bounds O(200) index scans per call |
 | TTL-bump asymmetry | Accepted (scout pays for own contact benefit) | Separate: TTL policy redesign tracked in #705 |
 | EvidenceUsed growth | Bounded by validator × milestone caps | Separate: storage cost model in STORAGE_COST_MODEL.md |
 | TrialEscrow backlog | EXPIRE_TRIAL_OFFERS_MAX_LIMIT + cooldown | Separate: ring-buffer redesign tracked separately |
@@ -269,7 +284,7 @@ No work in this audit duplicates the remediation tracked in the scalability issu
 | Vector | Severity | Status |
 |--------|----------|--------|
 | ValidatorVector O(N) scan | Medium | **Mitigated** — capped at 100 |
-| register_player spam → filter_players | Medium | **Mitigated** — per-call limit 50 |
+| register_player spam → filter_players | Medium | **Mitigated** — scan budget 200 + result cap 50 |
 | TTL-bump asymmetry | Low | **Accepted risk** |
 | EvidenceUsed key accumulation | Low | **Accepted risk** — bounded by caps |
 | OutstandingTrialEscrows backlog | Low-Medium | **Mitigated** — rate-limit + sweep cap |
